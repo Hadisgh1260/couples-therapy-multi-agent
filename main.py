@@ -1,6 +1,8 @@
 import asyncio
 import os
+import random
 
+import openai
 from dotenv import load_dotenv
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -29,6 +31,43 @@ THERAPIST_MODEL = os.getenv("THERAPIST_MODEL")
 
 
 # =========================
+# Retry Helper
+# =========================
+# The gateway sits behind a shared Cloudflare Worker that intermittently
+# returns 403 Forbidden or times out under certain request patterns, even
+# though the key/gateway themselves are valid. This wrapper retries with
+# exponential backoff + jitter so a single flaky call doesn't kill the
+# whole session.
+
+MAX_RETRIES = 5
+BASE_DELAY = 3  # seconds
+
+
+async def run_with_retry(agent, task, max_retries=MAX_RETRIES, base_delay=BASE_DELAY):
+
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await agent.run(task=task)
+
+        except (openai.APITimeoutError, openai.PermissionDeniedError, openai.APIConnectionError) as e:
+            last_error = e
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1.5)
+
+            print(
+                f"[retry] {agent.name} call failed "
+                f"({type(e).__name__}), attempt {attempt}/{max_retries}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+
+            if attempt < max_retries:
+                await asyncio.sleep(delay)
+
+    raise last_error
+
+
+# =========================
 # Create Client
 # =========================
 
@@ -38,6 +77,12 @@ def create_client(model, groq_api_key):
         model=model,
         api_key=GATEWAY_API_KEY,
         base_url=f"{GATEWAY_URL}/v1",
+
+        # Give the shared gateway more time to respond, and let the
+        # underlying OpenAI SDK do a couple of quick retries of its own
+        # before we fall back to our own slower retry loop above.
+        timeout=90,
+        max_retries=1,
 
         default_headers={
             "X-Groq-API-Key": groq_api_key,
@@ -140,9 +185,7 @@ Answer naturally in character.
     # Sara
     # =========================
 
-    sara_result = await woman.run(
-        task=sara_message
-    )
+    sara_result = await run_with_retry(woman, sara_message)
 
     sara = sara_result.messages[-1].content
 
@@ -170,9 +213,7 @@ The therapist asks:
 Respond naturally in character according to your profile.
 """
 
-    reza_result = await man.run(
-        task=reza_message
-    )
+    reza_result = await run_with_retry(man, reza_message)
 
     reza = reza_result.messages[-1].content
 
@@ -209,9 +250,7 @@ the therapy session.
 Do not produce the final report yet.
 """
 
-    therapist_result = await therapist.run(
-        task=therapist_message
-    )
+    therapist_result = await run_with_retry(therapist, therapist_message)
 
     therapist_response = therapist_result.messages[-1].content
 
@@ -223,8 +262,9 @@ Do not produce the final report yet.
     # Second Round - Sara
     # =========================
 
-    sara_result_2 = await woman.run(
-        task=f"""
+    sara_result_2 = await run_with_retry(
+        woman,
+        f"""
 The therapist said:
 
 "{therapist_response}"
@@ -234,7 +274,7 @@ as Sara.
 
 Stay in character and explain your feelings
 and perspective.
-"""
+""",
     )
 
     sara_2 = sara_result_2.messages[-1].content
@@ -247,8 +287,9 @@ and perspective.
     # Second Round - Reza
     # =========================
 
-    reza_result_2 = await man.run(
-        task=f"""
+    reza_result_2 = await run_with_retry(
+        man,
+        f"""
 The therapist said:
 
 "{therapist_response}"
@@ -261,7 +302,7 @@ Respond naturally as Reza.
 
 Stay in character and explain your feelings
 and perspective.
-"""
+""",
     )
 
     reza_2 = reza_result_2.messages[-1].content
@@ -318,9 +359,7 @@ SESSION_COMPLETE
 """
 
 
-    final_result = await therapist.run(
-        task=final_therapist_prompt
-    )
+    final_result = await run_with_retry(therapist, final_therapist_prompt)
 
     final_report = final_result.messages[-1].content
 
